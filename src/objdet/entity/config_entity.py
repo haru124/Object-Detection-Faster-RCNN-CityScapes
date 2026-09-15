@@ -13,6 +13,7 @@ class DataConfig:
     annotations_dir: str = "data/gtFine"
     num_workers: int = 4
     pin_memory: bool = True
+    max_samples: Optional[int] = None   # For debugging: limit number of samples (images) to load, set to null for no limit
 
     # Resolved paths — populated by __post_init__, NOT from YAML directly
     images_path: Path = field(default_factory=Path, init=False)
@@ -68,8 +69,16 @@ class TrainingConfig:
     lr_scheduler: str = "step"          # "step" | "cosine" | "none"
     lr_step_size: int = 7
     lr_gamma: float = 0.1
+    warmup: int = 0
     grad_clip: Optional[float] = None
     device: str = "cuda"
+    amp: bool = False                # AMP stub — not yet used in trainer
+    accumulation_steps: int = 1      # gradient accumulation stub
+    early_stopping: bool = True
+    early_stopping_patience: int = 5
+    early_stopping_min_delta: float = 0.0001
+    early_stopping_metric: str = "map_50_95"
+
 
 
 # ---------------------------------------------------------------------------
@@ -78,10 +87,12 @@ class TrainingConfig:
 @dataclass
 class LossConfig:
     classification: str = "cross_entropy"   # "cross_entropy" | "focal"
+    weights: Optional[List] = None
     box_regression: str = "smooth_l1"       # "smooth_l1" | "l1" | "giou" | "diou" | "ciou"
     focal_alpha: float = 0.25
     focal_gamma: float = 2.0
     smooth_l1_beta: float = 1.0
+
 
 
 # ---------------------------------------------------------------------------
@@ -103,6 +114,7 @@ class EvalConfig:
 class CheckpointingConfig:
     save_dir: str = "outputs/checkpoints/"
     save_every: int = 2
+    validate_every: int = 1
     keep_last: int = 3
     save_path: Path = field(default_factory=Path, init=False)
 
@@ -133,17 +145,6 @@ class ProfilerConfig:
 
 
 # ---------------------------------------------------------------------------
-# DEBUG
-# ---------------------------------------------------------------------------
-@dataclass
-class DebugConfig:
-    enabled: bool = False
-    image_height: int = 600
-    image_width: int = 800
-    batch_size: int = 2
-
-
-# ---------------------------------------------------------------------------
 # TOP-LEVEL PIPELINE CONFIG
 # ---------------------------------------------------------------------------
 @dataclass
@@ -158,4 +159,4 @@ class TrainingPipelineConfig:
     checkpointing: CheckpointingConfig = field(default_factory=CheckpointingConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     profiler: ProfilerConfig = field(default_factory=ProfilerConfig)
-    debug: DebugConfig = field(default_factory=DebugConfig)
+    

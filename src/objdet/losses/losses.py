@@ -254,7 +254,7 @@ def build_cls_loss_fn(loss_cfg: LossConfig):
     if loss_cfg.classification == "cross_entropy":
         return cross_entropy_loss
 
-    elif loss_cfg.classification == "focal":
+    elif loss_cfg.classification in ("focal", "focal_loss"):
         alpha = loss_cfg.focal_alpha
         gamma = loss_cfg.focal_gamma
 
@@ -262,12 +262,31 @@ def build_cls_loss_fn(loss_cfg: LossConfig):
             return focal_loss_fn(class_logits, labels, alpha=alpha, gamma=gamma)
 
         return _focal
+    
+    elif loss_cfg.classification == "weighted_cross_entropy":
+        # Weights: one per class (index 0 = background)
+        # Background weight should be low (< 1.0) to avoid penalizing
+        # the dominant class too heavily
+        weights = getattr(loss_cfg, "weights", None)
+        if weights is None:
+            raise ValueError(
+                "LossConfig.weights must be set for weighted_cross_entropy. "
+                "Provide one weight per class including background (index 0)."
+            )
+        weights_tensor = torch.tensor(weights, dtype=torch.float32)
+
+        def _wce(class_logits, labels):
+            w = weights_tensor.to(class_logits.device)
+            return F.cross_entropy(class_logits, labels, weight=w)
+
+        return _wce
 
     else:
         raise ValueError(
             f"Unknown classification loss: '{loss_cfg.classification}'. "
-            "Choose: 'cross_entropy' | 'focal'."
+            "Choose: 'cross_entropy' | 'focal' | 'weighted_cross_entropy'."
         )
+
 
 
 def build_box_loss_fn(loss_cfg: LossConfig):
@@ -313,8 +332,149 @@ def build_box_loss_fn(loss_cfg: LossConfig):
 # This avoids subclassing RoIHeads while keeping the rest of the pipeline intact.
 # ===========================================================================
 
+# ============================================================
+# CUSTOM ROI HEADS — supports IoU-based box regression losses
+# ============================================================
+
+from torchvision.models.detection.roi_heads import RoIHeads
+from typing import Dict, List, Optional, Tuple
+
+class CustomRoIHeads(RoIHeads):
+    """
+    Subclass of RoIHeads that properly supports IoU-based box regression.
+
+    For delta-based losses (smooth_l1, l1): identical to original RoIHeads.
+    For IoU-based losses (giou, diou, ciou): decodes predicted and target
+    deltas to xyxy absolute boxes using the box_coder, then computes IoU loss.
+
+    Why subclass instead of monkey-patching fastrcnn_loss()?
+        fastrcnn_loss() only receives encoded deltas — it has no access to
+        the proposal boxes needed for decoding. The proposal boxes are only
+        available inside RoIHeads.forward(). Subclassing gives us access.
+    """
+
+    def __init__(
+        self,
+        *args,
+        cls_loss_fn,
+        box_loss_fn,
+        uses_iou_loss: bool = False,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self._cls_loss_fn = cls_loss_fn
+        self._box_loss_fn = box_loss_fn
+        self._uses_iou_loss = uses_iou_loss
+
+    def forward(
+        self,
+        features: Dict[str, torch.Tensor],
+        proposals: List[torch.Tensor],
+        image_shapes: List[Tuple[int, int]],
+        targets: Optional[List[Dict[str, torch.Tensor]]] = None,
+    ):
+        if self.training:
+            proposals, matched_idxs, labels, regression_targets = \
+                self.select_training_samples(proposals, targets)
+        else:
+            labels = None
+            regression_targets = None
+            matched_idxs = None
+
+        box_features = self.box_roi_pool(features, proposals, image_shapes)
+        box_features = self.box_head(box_features)
+        class_logits, box_regression = self.box_predictor(box_features)
+
+        result: List[Dict[str, torch.Tensor]] = []
+        losses: Dict[str, torch.Tensor] = {}
+
+        if self.training:
+            assert labels is not None and regression_targets is not None
+            loss_classifier, loss_box_reg = self._compute_custom_loss(
+                class_logits, box_regression,
+                labels, regression_targets,
+                proposals,        # ← THIS is what the monkey-patch lacked
+            )
+            losses = {
+                "loss_classifier": loss_classifier,
+                "loss_box_reg":    loss_box_reg,
+            }
+        else:
+            boxes, scores, class_labels = self.postprocess_detections(
+                class_logits, box_regression, proposals, image_shapes
+            )
+            for i in range(len(boxes)):
+                result.append({
+                    "boxes":  boxes[i],
+                    "labels": class_labels[i],
+                    "scores": scores[i],
+                })
+
+        return result, losses
+
+    def _compute_custom_loss(
+        self,
+        class_logits:        torch.Tensor,
+        box_regression:      torch.Tensor,
+        labels:              List[torch.Tensor],
+        regression_targets:  List[torch.Tensor],
+        proposals:           List[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+
+        labels_flat            = torch.cat(labels, dim=0)
+        regression_targets_flat = torch.cat(regression_targets, dim=0)
+
+        # ── Classification loss ────────────────────────────────────────
+        classification_loss = self._cls_loss_fn(class_logits, labels_flat)
+
+        # ── Box regression: positive proposals only ────────────────────
+        sampled_pos_inds = torch.where(labels_flat > 0)[0]
+        if sampled_pos_inds.numel() == 0:
+            return classification_loss, box_regression.sum() * 0.0
+
+        num_classes  = box_regression.shape[1] // 4
+        labels_pos   = labels_flat[sampled_pos_inds]
+
+        # Select the 4 deltas for each proposal's ground-truth class
+        box_regression_pos = box_regression[sampled_pos_inds]              # [N_pos, C*4]
+        box_regression_pos = box_regression_pos.reshape(-1, num_classes, 4)[
+            torch.arange(len(labels_pos)), labels_pos
+        ]                                                                   # [N_pos, 4]
+
+        regression_targets_pos = regression_targets_flat[sampled_pos_inds] # [N_pos, 4]
+
+        if self._uses_iou_loss:
+            # Decode encoded deltas → absolute xyxy boxes
+            # box_coder.decode(encoded_deltas, reference_boxes) → xyxy
+            proposals_flat = torch.cat(proposals, dim=0)
+            proposals_pos  = proposals_flat[sampled_pos_inds]              # [N_pos, 4]
+
+            # BoxCoder.decode() requires boxes as List[Tensor], not raw Tensor
+            pred_boxes   = self.box_coder.decode(box_regression_pos,     [proposals_pos])  # ← list
+            target_boxes = self.box_coder.decode(regression_targets_pos, [proposals_pos])  # ← list
+
+            # decode() returns [N_pos, 1, 4] when given a list — squeeze the middle dim
+            # Squeeze [N,1,4] → [N,4] if torchvision returns extra dim
+            pred_boxes   = pred_boxes.squeeze(1) if pred_boxes.dim() == 3 else pred_boxes    # [N,4]
+            target_boxes = target_boxes.squeeze(1) if target_boxes.dim() == 3 else target_boxes  # [N,4]
+
+            # Clamp to valid range (decoding can produce negative coords)
+            pred_boxes   = pred_boxes.clamp(min=0)
+            target_boxes = target_boxes.clamp(min=0)
+
+            box_loss = self._box_loss_fn(pred_boxes, target_boxes)
+        else:
+            box_loss = self._box_loss_fn(box_regression_pos, regression_targets_pos)
+
+        return classification_loss, box_loss
+
+
 def patch_roi_head_losses(model, loss_cfg: LossConfig):
     """
+    Now replaces roi_heads entirely with CustomRoIHeads subclass,
+    which has access to proposals inside forward() and properly decodes
+    deltas to xyxy boxes for GIoU/DIoU/CIoU computation.
+
     Patch model.roi_heads.fastrcnn_loss() to use the losses specified in loss_cfg.
 
     torchvision's RoIHeads.fastrcnn_loss() is a static/class method that
@@ -338,90 +498,37 @@ def patch_roi_head_losses(model, loss_cfg: LossConfig):
     cls_loss_fn = build_cls_loss_fn(loss_cfg)
     box_loss_fn = build_box_loss_fn(loss_cfg)
     uses_iou_loss = loss_cfg.box_regression in ("giou", "diou", "ciou")
-
+    
     print(
-        f"[Losses] Patching ROI head losses: "
-        f"cls={loss_cfg.classification}, "
-        f"box={loss_cfg.box_regression}"
+        f"[Losses] Replacing roi_heads with CustomRoIHeads | "
+        f"cls={loss_cfg.classification} | "
+        f"box={loss_cfg.box_regression} | "
+        f"iou_decode={uses_iou_loss}"
     )
 
-    def _patched_fastrcnn_loss(class_logits, box_regression, labels, regression_targets):
-        """
-        Replacement for torchvision.models.detection.roi_heads.fastrcnn_loss.
+    old = model.roi_heads   # existing RoIHeads — copy all its parameters
 
-        The original computes:
-            classification_loss = F.cross_entropy(class_logits, labels)
-            box_loss = smooth_l1_loss(pred_boxes, regression_targets, ...)
+    model.roi_heads = CustomRoIHeads(
+        # ── Custom loss functions ──────────────────────────────────
+        cls_loss_fn   = cls_loss_fn,
+        box_loss_fn   = box_loss_fn,
+        uses_iou_loss = uses_iou_loss,
+        # ── ROI components (unchanged from existing model) ─────────
+        box_roi_pool  = old.box_roi_pool,
+        box_head      = old.box_head,
+        box_predictor = old.box_predictor,
+        # ── Matcher thresholds ─────────────────────────────────────
+        fg_iou_thresh = old.proposal_matcher.high_threshold,
+        bg_iou_thresh = old.proposal_matcher.low_threshold,
+        # ── Sampler ────────────────────────────────────────────────
+        batch_size_per_image = old.fg_bg_sampler.batch_size_per_image,
+        positive_fraction    = old.fg_bg_sampler.positive_fraction,
+        # ── Box coder weights ──────────────────────────────────────
+        bbox_reg_weights = old.box_coder.weights,
+        # ── Inference thresholds ───────────────────────────────────
+        score_thresh      = old.score_thresh,
+        nms_thresh        = old.nms_thresh,
+        detections_per_img = old.detections_per_img,
+    )
+    print("[Losses] CustomRoIHeads assigned successfully. GIoU/DIoU/CIoU now work.")
 
-        We replace both with our configurable versions.
-        """
-        # Flatten labels across all images in the batch
-        labels_flat = torch.cat(labels, dim=0)           # [total_proposals]
-        regression_targets_flat = torch.cat(             # [total_proposals, 4]
-            regression_targets, dim=0
-        )
-
-        # --- Classification loss ---
-        classification_loss = cls_loss_fn(class_logits, labels_flat)
-
-        # --- Box regression loss ---
-        # Only compute regression loss for FOREGROUND proposals (label > 0).
-        # Background proposals (label == 0) have no meaningful box to regress.
-        sampled_pos_inds = torch.where(labels_flat > 0)[0]
-
-        if sampled_pos_inds.numel() == 0:
-            # No positive proposals in this batch — zero regression loss
-            box_loss = box_regression.sum() * 0.0
-            return classification_loss, box_loss
-
-        num_classes = box_regression.shape[1] // 4
-
-        if uses_iou_loss:
-            # IoU losses require DECODED xyxy boxes, not delta encodings.
-            # We decode using the box_coder from model.roi_heads.box_coder.
-            # Since we're inside a patched function, we access box_coder via
-            # a closure variable set by the caller.
-
-            # For non-IoU losses: operate on encoded deltas (standard).
-            # For IoU losses: we fall back to smooth_l1 on deltas since
-            # decoding requires the proposal boxes which aren't passed here.
-            # Full IoU-loss support would require subclassing RoIHeads.
-            # This is a known limitation of the monkey-patch approach.
-
-            # PRACTICAL NOTE: For production IoU-based regression in Faster
-            # R-CNN, subclass RoIHeads and override forward(). For now,
-            # we fall back to smooth_l1 for the regression term and log a warning.
-            import warnings
-            warnings.warn(
-                f"[Losses] {loss_cfg.box_regression} loss requires decoded xyxy "
-                "boxes, which are not available in the fastrcnn_loss() patch. "
-                "Falling back to smooth_l1 for box regression. "
-                "To use IoU losses properly, subclass RoIHeads."
-            )
-            box_loss_fn_actual = lambda p, t: smooth_l1_loss(p, t, beta=1.0)
-        else:
-            box_loss_fn_actual = box_loss_fn
-
-        # Select the regression output for each proposal's PREDICTED class
-        # box_regression[i] has shape [num_classes*4]; we want the 4 values
-        # corresponding to the ground-truth class label for proposal i.
-        labels_pos = labels_flat[sampled_pos_inds]  # [N_pos]
-
-        # Index into box_regression to get the 4 deltas for each proposal's class
-        # box_regression: [total_proposals, num_classes * 4]
-        # We want: for proposal i with label l_i → box_regression[i, l_i*4 : l_i*4+4]
-        box_regression_pos = box_regression[sampled_pos_inds]         # [N_pos, C*4]
-        box_regression_pos = box_regression_pos.reshape(
-            -1, num_classes, 4
-        )[torch.arange(len(labels_pos)), labels_pos]                  # [N_pos, 4]
-
-        regression_targets_pos = regression_targets_flat[sampled_pos_inds]  # [N_pos, 4]
-
-        box_loss = box_loss_fn_actual(box_regression_pos, regression_targets_pos)
-
-        return classification_loss, box_loss
-
-    # Bind the patched function to the roi_heads instance
-    import types
-    model.roi_heads.fastrcnn_loss = _patched_fastrcnn_loss
-    print("[Losses] ROI head losses patched successfully.")

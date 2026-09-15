@@ -4,7 +4,7 @@ import yaml
 
 from objdet.entity.config_entity import (
     DataConfig, ModelConfig, TrainingConfig, LossConfig, EvalConfig,
-    CheckpointingConfig, LoggingConfig, ProfilerConfig, DebugConfig,
+    CheckpointingConfig, LoggingConfig, ProfilerConfig,
     TrainingPipelineConfig,
 )
 
@@ -53,7 +53,6 @@ class ConfigurationManager:
             checkpointing=self._checkpointing_config(r.get("checkpointing", {})),
             logging=self._logging_config(r.get("logging", {})),
             profiler=self._profiler_config(r.get("profiler", {})),
-            debug=self._debug_config(r.get("debug", {})),
         )
 
     # ------------------------------------------------------------------
@@ -67,6 +66,7 @@ class ConfigurationManager:
             annotations_dir=d.get("annotations_dir", "data/gtFine"),
             num_workers=d.get("num_workers", 4),
             pin_memory=d.get("pin_memory", True),
+            max_samples=d.get("max_samples", None),
         )
 
     @staticmethod
@@ -93,14 +93,23 @@ class ConfigurationManager:
             lr_scheduler=d.get("lr_scheduler", "step"),
             lr_step_size=d.get("lr_step_size", 7),
             lr_gamma=d.get("lr_gamma", 0.1),
+            warmup = d.get("warmup", 0),
             grad_clip=d.get("grad_clip", None),
             device=d.get("device", "cuda"),
+            amp=d.get("amp", False),
+            accumulation_steps=d.get("accumulation_steps", 1),
+            early_stopping = d.get("early_stopping",True),
+            early_stopping_patience = d.get("early_stopping_patience", 5),
+            early_stopping_min_delta = d.get("early_stopping_min_delta", 0.00001),
+            early_stopping_metric = d.get("early_stopping_metric", "map_50_95"),
+
         )
 
     @staticmethod
     def _loss_config(d: dict) -> LossConfig:
         return LossConfig(
             classification=d.get("classification", "cross_entropy"),
+            weights = d.get("weights",None),
             box_regression=d.get("box_regression", "smooth_l1"),
             focal_alpha=d.get("focal_alpha", 0.25),
             focal_gamma=d.get("focal_gamma", 2.0),
@@ -122,6 +131,7 @@ class ConfigurationManager:
         return CheckpointingConfig(
             save_dir=d.get("save_dir", "outputs/checkpoints/"),
             save_every=d.get("save_every", 2),
+            validate_every=d.get("validate_every", 1), 
             keep_last=d.get("keep_last", 3),
         )
 
@@ -143,11 +153,3 @@ class ConfigurationManager:
             output_dir=d.get("output_dir", "outputs/profiler/"),
         )
 
-    @staticmethod
-    def _debug_config(d: dict) -> DebugConfig:
-        return DebugConfig(
-            enabled=d.get("enabled", False),
-            image_height=d.get("image_height", 600),
-            image_width=d.get("image_width", 800),
-            batch_size=d.get("batch_size", 2),
-        )
